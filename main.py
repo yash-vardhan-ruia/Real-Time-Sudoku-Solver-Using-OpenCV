@@ -3,13 +3,48 @@ import numpy as np
 from collections import Counter
 
 # Enable GPU acceleration for OpenCV
-print("Initializing GPU...")
-print(f"CUDA Available: {cv2.cuda.getCudaEnabledDeviceCount() > 0}")
-if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-    cv2.cuda.setDevice(0)
-    print("GPU initialized successfully")
+print("=" * 50)
+print("Initializing GPU Support...")
+print("=" * 50)
+
+# Check if OpenCV was compiled with CUDA support
+print(f"OpenCV Version: {cv2.__version__}")
+print(f"OpenCV Build Info: {cv2.getBuildInformation()[:500]}")
+
+gpu_available = False
+try:
+    cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
+    print(f"CUDA Devices Found: {cuda_count}")
+    
+    if cuda_count > 0:
+        gpu_available = True
+        cv2.cuda.setDevice(0)
+        
+        # Get device properties
+        device = cv2.cuda.getDevice()
+        print(f"Active GPU Device: {device}")
+        print("✓ GPU acceleration ENABLED")
+    else:
+        print("✗ No CUDA devices detected")
+        print("\nTo enable GPU support on Windows:")
+        print("1. Install NVIDIA CUDA Toolkit 12.x")
+        print("2. Install cuDNN from NVIDIA")
+        print("3. Rebuild OpenCV from source with CUDA support")
+        print("   OR use: pip install opencv-contrib-python (already done)")
+        print("4. Ensure GPU drivers are up to date")
+except Exception as e:
+    print(f"✗ GPU Access Error: {e}")
+    print("Note: OpenCV may not be compiled with CUDA support")
+    print("      Standard opencv-python doesn't include CUDA.")
+    print("      You have installed opencv-contrib-python which is compatible.")
+    print("      Please ensure NVIDIA CUDA Toolkit is installed on your system.")
+
+print("=" * 50)
+if not gpu_available:
+    print("Using CPU acceleration (slower processing)")
 else:
-    print("No CUDA GPU found, using CPU")
+    print("Using GPU acceleration (faster processing)")
+print("=" * 50 + "\n")
 
 # Initialize video capture
 cap = cv2.VideoCapture(0)
@@ -155,11 +190,15 @@ while True:
 
     # Preprocess the frame with GPU acceleration if available
     processed = gray.copy()
-    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-        gpu_gray = cv2.cuda_GpuMat()
-        gpu_gray.upload(gray)
-        gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (9, 9), 1.5).apply(gpu_gray)
-        gpu_blur.download(processed)
+    if gpu_available:
+        try:
+            gpu_gray = cv2.cuda_GpuMat()
+            gpu_gray.upload(gray)
+            gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (9, 9), 1.5).apply(gpu_gray)
+            gpu_blur.download(processed)
+        except Exception as e:
+            print(f"GPU processing failed, falling back to CPU: {e}")
+            processed = cv2.GaussianBlur(gray, (9, 9), 0)
     else:
         processed = cv2.GaussianBlur(gray, (9, 9), 0)
     
@@ -175,6 +214,10 @@ while True:
         # Resize the sudoku grid to a standard size
         target_size = 450
         grid_height, grid_width = sudoku_grid.shape[:2]
+        
+        if grid_width == 0 or grid_height == 0:
+            continue
+        
         scale = min(target_size / grid_width, target_size / grid_height)
         
         new_width = int(grid_width * scale)
@@ -194,38 +237,53 @@ while True:
         cell_height = new_height // rows
         cell_width = new_width // cols
         
-        cells = [np.hsplit(row, cols) for row in np.vsplit(sudoku_grid, rows)]
+        try:
+            cells = [np.hsplit(row, cols) for row in np.vsplit(sudoku_grid, rows)]
+        except Exception as e:
+            print(f"Error splitting grid: {e}")
+            continue
         
         # Initialize grid to store recognized digits
         sudoku_digits = np.zeros((9, 9), dtype=int)
         
         # Extract and recognize digits in each cell
-        for i in range(9):
-            for j in range(9):
-                cell = cells[i][j]
-                # Invert so white digits become black for processing
-                cell_inverted = cv2.bitwise_not(cell)
-                
-                # Recognize the digit
-                digit = recognize_digit_template(cell_inverted)
-                sudoku_digits[i, j] = digit
+        try:
+            for i in range(9):
+                for j in range(9):
+                    cell = cells[i][j]
+                    # Invert so white digits become black for processing
+                    cell_inverted = cv2.bitwise_not(cell)
+                    
+                    # Recognize the digit
+                    digit = recognize_digit_template(cell_inverted)
+                    sudoku_digits[i, j] = digit
+        except Exception as e:
+            print(f"Error recognizing digits: {e}")
+            continue
         
         # Only solve if grid has enough filled cells
         filled_cells = np.count_nonzero(sudoku_digits)
         if filled_cells > 17:  # Valid sudoku typically has at least 17 clues
-            # Make a copy for solving
-            grid_copy = sudoku_digits.copy()
-            solve_sudoku(grid_copy)
-            
-            # Overlay the solution on the frame
-            for i in range(9):
-                for j in range(9):
-                    if sudoku_digits[i, j] == 0 and grid_copy[i, j] != 0:
-                        # This is a solved cell (was empty before)
-                        cell_x = grid_x + j * cell_width + cell_width // 2
-                        cell_y = grid_y + i * cell_height + cell_height // 2
-                        cv2.putText(frame, str(grid_copy[i, j]), (cell_x - 15, cell_y + 15), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            try:
+                # Make a copy for solving
+                grid_copy = sudoku_digits.copy()
+                solve_sudoku(grid_copy)
+                
+                # Calculate scale factors from original grid to frame
+                scale_x = grid_w / new_width if new_width > 0 else 1
+                scale_y = grid_h / new_height if new_height > 0 else 1
+                
+                # Overlay the solution on the frame
+                for i in range(9):
+                    for j in range(9):
+                        if sudoku_digits[i, j] == 0 and grid_copy[i, j] != 0:
+                            # This is a solved cell (was empty before)
+                            cell_x = int(grid_x + j * cell_width * scale_x + cell_width * scale_x // 2)
+                            cell_y = int(grid_y + i * cell_height * scale_y + cell_height * scale_y // 2)
+                            cv2.putText(frame, str(grid_copy[i, j]), (cell_x - 15, cell_y + 15), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            except Exception as e:
+                print(f"Error solving sudoku: {e}")
         
         # Draw the grid boundaries for visualization
         cv2.rectangle(frame, (grid_x, grid_y), (grid_x + grid_w, grid_y + grid_h), (255, 0, 0), 2)
