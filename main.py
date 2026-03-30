@@ -1,10 +1,23 @@
 import cv2
 import numpy as np
+from collections import deque
 from sklearn.datasets import load_digits
 from sklearn.neighbors import KNeighborsClassifier
 
 GRID_SIZE = 450
 CELL_SIZE = GRID_SIZE // 9
+
+CELL_MARGIN_RATIO = 0.22
+MIN_COMPONENT_AREA_RATIO = 0.03
+MIN_COMPONENT_FILL_RATIO = 0.12
+MIN_PREDICTION_CONFIDENCE = 0.70
+MIN_CONFIDENCE_MARGIN = 0.12
+CORNER_SMOOTHING_WINDOW = 5
+
+WARP_DESTINATION = np.array(
+    [[0, 0], [GRID_SIZE - 1, 0], [GRID_SIZE - 1, GRID_SIZE - 1], [0, GRID_SIZE - 1]],
+    dtype="float32",
+)
 
 print("=" * 50)
 print("Initializing GPU Support...")
@@ -71,13 +84,8 @@ def find_and_warp_grid(gray, binary):
         points = approximation.reshape(4, 2).astype("float32")
         ordered = order_points(points)
 
-        destination = np.array(
-            [[0, 0], [GRID_SIZE - 1, 0], [GRID_SIZE - 1, GRID_SIZE - 1], [0, GRID_SIZE - 1]],
-            dtype="float32",
-        )
-
-        perspective_matrix = cv2.getPerspectiveTransform(ordered, destination)
-        inverse_matrix = cv2.getPerspectiveTransform(destination, ordered)
+        perspective_matrix = cv2.getPerspectiveTransform(ordered, WARP_DESTINATION)
+        inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, ordered)
 
         warped_gray = cv2.warpPerspective(gray, perspective_matrix, (GRID_SIZE, GRID_SIZE))
         warped_binary = cv2.warpPerspective(binary, perspective_matrix, (GRID_SIZE, GRID_SIZE))
@@ -87,10 +95,13 @@ def find_and_warp_grid(gray, binary):
 
 
 def preprocess_cell(cell_binary):
-    margin = int(CELL_SIZE * 0.18)
+    margin = int(CELL_SIZE * CELL_MARGIN_RATIO)
     cropped = cell_binary[margin:CELL_SIZE - margin, margin:CELL_SIZE - margin]
     if cropped.size == 0:
         return None
+
+    kernel = np.ones((2, 2), dtype=np.uint8)
+    cropped = cv2.morphologyEx(cropped, cv2.MORPH_OPEN, kernel)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cropped, connectivity=8)
     if num_labels <= 1:
@@ -116,17 +127,28 @@ def preprocess_cell(cell_binary):
     if largest_label is None:
         return None
 
-    minimum_area = cropped.shape[0] * cropped.shape[1] * 0.02
+    minimum_area = cropped.shape[0] * cropped.shape[1] * MIN_COMPONENT_AREA_RATIO
     if largest_area < minimum_area:
         return None
-
-    mask = np.zeros_like(cropped, dtype=np.uint8)
-    mask[labels == largest_label] = 255
 
     x = stats[largest_label, cv2.CC_STAT_LEFT]
     y = stats[largest_label, cv2.CC_STAT_TOP]
     w = stats[largest_label, cv2.CC_STAT_WIDTH]
     h = stats[largest_label, cv2.CC_STAT_HEIGHT]
+
+    if w <= 2 or h <= 6:
+        return None
+
+    fill_ratio = largest_area / float(w * h)
+    if fill_ratio < MIN_COMPONENT_FILL_RATIO:
+        return None
+
+    aspect_ratio = w / float(h)
+    if aspect_ratio < 0.08 or aspect_ratio > 1.4:
+        return None
+
+    mask = np.zeros_like(cropped, dtype=np.uint8)
+    mask[labels == largest_label] = 255
 
     digit = mask[y:y + h, x:x + w]
     if digit.size == 0:
@@ -154,11 +176,20 @@ def predict_digit(cell_binary):
     sample = sample.reshape(1, -1)
 
     probabilities = DIGIT_MODEL.predict_proba(sample)[0]
-    prediction = int(np.argmax(probabilities))
-    confidence = float(np.max(probabilities))
+    sorted_indices = np.argsort(probabilities)[::-1]
+    prediction = int(sorted_indices[0])
+    confidence = float(probabilities[sorted_indices[0]])
+    runner_up_confidence = float(probabilities[sorted_indices[1]])
 
-    if prediction == 0 or confidence < 0.50:
+    if prediction == 0:
         return 0
+
+    if confidence < MIN_PREDICTION_CONFIDENCE:
+        return 0
+
+    if (confidence - runner_up_confidence) < MIN_CONFIDENCE_MARGIN:
+        return 0
+
     return prediction
 
 
@@ -223,6 +254,10 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+corner_history = deque(maxlen=CORNER_SMOOTHING_WINDOW)
+previous_grid = None
+cached_solution = None
+
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -249,7 +284,14 @@ while True:
             break
         continue
 
-    _, warped_binary, corners, inverse_matrix = warped_result
+    _, warped_binary, corners, _ = warped_result
+
+    corner_history.append(corners)
+    smoothed_corners = np.mean(np.array(corner_history), axis=0).astype(np.float32)
+    smoothed_perspective = cv2.getPerspectiveTransform(smoothed_corners, WARP_DESTINATION)
+    inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, smoothed_corners)
+    warped_binary = cv2.warpPerspective(binary, smoothed_perspective, (GRID_SIZE, GRID_SIZE))
+
     sudoku_digits = np.zeros((9, 9), dtype=int)
 
     for row in range(9):
@@ -264,12 +306,22 @@ while True:
     filled_cells = int(np.count_nonzero(sudoku_digits))
     valid_clues = is_valid_initial_grid(sudoku_digits)
 
-    polygon = corners.astype(np.int32).reshape((-1, 1, 2))
+    polygon = smoothed_corners.astype(np.int32).reshape((-1, 1, 2))
     cv2.polylines(frame, [polygon], True, (255, 0, 0), 2)
 
     if filled_cells >= 17 and valid_clues:
-        solved_grid = sudoku_digits.copy()
-        if solve_sudoku(solved_grid):
+        grid_matches_previous = previous_grid is not None and np.array_equal(sudoku_digits, previous_grid)
+
+        if grid_matches_previous and cached_solution is not None:
+            solved_grid = cached_solution
+            solved = True
+        else:
+            solved_grid = sudoku_digits.copy()
+            solved = solve_sudoku(solved_grid)
+            previous_grid = sudoku_digits.copy()
+            cached_solution = solved_grid.copy() if solved else None
+
+        if solved:
             for row in range(9):
                 for col in range(9):
                     if sudoku_digits[row, col] != 0:
@@ -292,6 +344,9 @@ while True:
                         2,
                         cv2.LINE_AA,
                     )
+    else:
+        previous_grid = None
+        cached_solution = None
 
     status_color = (0, 255, 0) if valid_clues else (0, 0, 255)
     status_text = f"Detected: {filled_cells} cells"
