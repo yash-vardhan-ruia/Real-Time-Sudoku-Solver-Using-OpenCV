@@ -18,33 +18,44 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 def detect_sudoku_grid(processed_frame):
     """Detect and extract the sudoku grid from the processed frame"""
-    contours, _ = cv2.findContours(processed_frame.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if len(contours) == 0:
-        return None
-    
-    # Filter contours by area and aspect ratio to find the sudoku grid
-    valid_contours = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 10000:  # Minimum area for sudoku grid
-            continue
+    try:
+        contours, _ = cv2.findContours(processed_frame.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = float(w) / h if h > 0 else 0
+        if len(contours) == 0:
+            return None
         
-        # Sudoku grid should be roughly square (0.7 to 1.3 aspect ratio)
-        if 0.7 < aspect_ratio < 1.3:
-            valid_contours.append((contour, area))
+        # Filter contours by area and aspect ratio to find the sudoku grid
+        valid_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 5000:  # Minimum area for sudoku grid (lowered threshold)
+                continue
+            
+            x, y, w, h = cv2.boundingRect(contour)
+            if w == 0 or h == 0:
+                continue
+                
+            aspect_ratio = float(w) / h
+            
+            # Sudoku grid should be roughly square (0.6 to 1.4 aspect ratio)
+            if 0.6 < aspect_ratio < 1.4:
+                valid_contours.append((contour, area, (x, y, w, h)))
+        
+        if not valid_contours:
+            return None
+        
+        # Get the largest valid contour (the sudoku grid)
+        largest_contour, _, (x, y, w, h) = max(valid_contours, key=lambda x: x[1])
+        
+        # Ensure we have valid bounds
+        if x >= 0 and y >= 0 and w > 0 and h > 0:
+            if y + h <= processed_frame.shape[0] and x + w <= processed_frame.shape[1]:
+                return processed_frame[y:y + h, x:x + w], (x, y, w, h)
     
-    if not valid_contours:
-        return None
+    except Exception as e:
+        print(f"Error in detect_sudoku_grid: {e}")
     
-    # Get the largest valid contour (the sudoku grid)
-    largest_contour, _ = max(valid_contours, key=lambda x: x[1])
-    x, y, w, h = cv2.boundingRect(largest_contour)
-    
-    return processed_frame[y:y + h, x:x + w], (x, y, w, h)
+    return None
 
 def recognize_digit_template(cell):
     """Recognize digits using template matching and morphological operations"""
@@ -57,69 +68,34 @@ def recognize_digit_template(cell):
     # Count non-zero pixels
     non_zero_count = cv2.countNonZero(binary)
     total_pixels = cell.size
-    fill_ratio = non_zero_count / total_pixels
+    fill_ratio = non_zero_count / total_pixels if total_pixels > 0 else 0
     
     # If fill ratio is too low, cell is empty
     if fill_ratio < 0.05:
         return 0
     
-    # Resize cell to standard size for analysis
-    resized = cv2.resize(cell, (32, 32))
+    # Use pixel density for digit estimation (1-9)
+    # Normalize to 0-1 range
+    normalized_density = min(1.0, fill_ratio / 0.5)
     
-    # Apply morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    morph = cv2.morphologyEx(resized, cv2.MORPH_CLOSE, kernel)
-    
-    # Find contours in the cell
-    contours, _ = cv2.findContours(morph.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if len(contours) == 0:
-        return 0
-    
-    # Get the largest contour (the digit)
-    digit_contour = max(contours, key=cv2.contourArea)
-    contour_area = cv2.contourArea(digit_contour)
-    
-    if contour_area < 50:
-        return 0
-    
-    # Calculate shape descriptors
-    x, y, w, h = cv2.boundingRect(digit_contour)
-    aspect_ratio = float(w) / h if h > 0 else 0
-    
-    # Use Hu moments for digit classification
-    hu_moments = cv2.HuMoments(digit_contour).flatten()
-    
-    # Simple heuristic based on multiple features
-    area_ratio = contour_area / (32 * 32)
-    
-    # Classify digit based on characteristics
-    if area_ratio < 0.1:
-        return 0  # Too small
-    elif aspect_ratio > 2.0 or aspect_ratio < 0.3:
-        return 0  # Too elongated, probably noise
-    
-    # Use pixel density for rough digit estimation
-    white_pixels = cv2.countNonZero(resized)
-    
-    # Map pixel count to digit ranges (1-9)
-    if white_pixels < 50:
-        return 0
-    elif white_pixels < 120:
+    # Map to digit range
+    if fill_ratio < 0.08:
+        return 0  # Empty
+    elif fill_ratio < 0.15:
         return 1
-    elif white_pixels < 180:
+    elif fill_ratio < 0.22:
         return 2
-    elif white_pixels < 250:
+    elif fill_ratio < 0.29:
         return 3
-    elif white_pixels < 320:
+    elif fill_ratio < 0.36:
         return 4
-    elif white_pixels < 400:
+    elif fill_ratio < 0.43:
         return 5
-    elif white_pixels < 480:
+    elif fill_ratio < 0.50:
         return 6
-    elif white_pixels < 560:
+    elif fill_ratio < 0.57:
         return 7
-    elif white_pixels < 640:
+    elif fill_ratio < 0.64:
         return 8
     else:
         return 9
