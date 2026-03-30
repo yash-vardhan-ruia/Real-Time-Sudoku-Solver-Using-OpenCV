@@ -13,8 +13,8 @@ MIN_COMPONENT_AREA_RATIO = 0.015
 MIN_COMPONENT_FILL_RATIO = 0.12
 MIN_PREDICTION_CONFIDENCE = 0.58
 MIN_CONFIDENCE_MARGIN = 0.06
-CORNER_SMOOTHING_WINDOW = 25
-CORNER_MAX_DRIFT = 15.0
+CORNER_SMOOTHING_WINDOW = 50
+CORNER_MAX_DRIFT = 8.0
 DIGIT_SMOOTHING_WINDOW = 5
 MIN_EMPTY_PIXEL_RATIO = 0.03
 TEMPORAL_DECAY = 0.72
@@ -26,6 +26,7 @@ LOW_DIGIT_PROBABILITY_THRESHOLD = 0.34
 ABS_DIGIT_CANDIDATE_PROB = 0.03
 RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
 MAX_DIGIT_CANDIDATES = 5
+SOLUTION_PERSISTENCE_FRAMES = 60
 
 MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.pth")
 
@@ -492,6 +493,8 @@ smoothed_corners_anchor = None
 probability_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
 previous_signature = None
 cached_solution = None
+solution_display_grid = None
+solution_display_counter = 0
 
 while True:
     ret, frame = cap.read()
@@ -509,6 +512,7 @@ while True:
                 probability_history[row][col].clear()
         previous_signature = None
         cached_solution = None
+        solution_display_counter = 0
         cv2.putText(frame, "Grid not found", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Real-Time Sudoku Solver", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -560,12 +564,19 @@ while True:
         if signature == previous_signature and cached_solution is not None:
             solved = True
             solved_grid = cached_solution
+            solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
         else:
             solved, solved_grid = solve_sudoku_with_probabilities(probability_tensor)
-            previous_signature = signature
-            cached_solution = solved_grid.copy() if solved else None
+            if solved:
+                previous_signature = signature
+                cached_solution = solved_grid.copy()
+                solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
+            else:
+                solution_display_counter = max(0, solution_display_counter - 1)
+    else:
+        solution_display_counter = max(0, solution_display_counter - 1)
 
-    if solved and solved_grid is not None:
+    if solution_display_counter > 0 and cached_solution is not None:
         for row in range(9):
             for col in range(9):
                 if confident_grid[row, col] != 0:
@@ -573,7 +584,7 @@ while True:
 
                 warped_point = np.array([[[col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2]]], dtype=np.float32)
                 frame_point = cv2.perspectiveTransform(warped_point, inverse_matrix)[0][0]
-                solved_text = str(int(solved_grid[row, col]))
+                solved_text = str(int(cached_solution[row, col]))
                 font_scale = 0.8
                 thickness = 2
                 text_size, baseline = cv2.getTextSize(solved_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
