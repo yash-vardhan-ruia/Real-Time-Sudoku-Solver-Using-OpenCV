@@ -1,9 +1,7 @@
 import cv2
 import numpy as np
-import pickle
 from pathlib import Path
 from collections import deque
-from sklearn.neural_network import MLPClassifier
 
 GRID_SIZE = 450
 CELL_SIZE = GRID_SIZE // 9
@@ -16,13 +14,17 @@ MIN_CONFIDENCE_MARGIN = 0.06
 CORNER_SMOOTHING_WINDOW = 5
 DIGIT_SMOOTHING_WINDOW = 5
 MIN_EMPTY_PIXEL_RATIO = 0.03
-MIN_DIGIT_VOTE_SHARE = 0.55
 TEMPORAL_DECAY = 0.72
-MIN_TEMPORAL_CONFIDENCE = 0.45
 MODEL_IMAGE_SIZE = 28
-SAMPLES_PER_DIGIT = 450
-EMPTY_SAMPLES = 1200
-MODEL_CACHE_PATH = Path(__file__).with_name("printed_digit_model.pkl")
+
+MIN_CLUES_TO_SOLVE = 17
+EMPTY_CELL_PROBABILITY_THRESHOLD = 0.52
+LOW_DIGIT_PROBABILITY_THRESHOLD = 0.34
+ABS_DIGIT_CANDIDATE_PROB = 0.03
+RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
+MAX_DIGIT_CANDIDATES = 5
+
+MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.onnx")
 
 BLUR_KERNEL_SIZE = (7, 7)
 THRESH_BLOCK_SIZE = 11
@@ -59,125 +61,29 @@ print("Using GPU acceleration (faster processing)" if gpu_available else "Using 
 print("=" * 50 + "\n")
 
 
-def generate_printed_digit_dataset(samples_per_digit=SAMPLES_PER_DIGIT, empty_samples=EMPTY_SAMPLES):
-    rng = np.random.default_rng(42)
-    fonts = [
-        cv2.FONT_HERSHEY_SIMPLEX,
-        cv2.FONT_HERSHEY_DUPLEX,
-        cv2.FONT_HERSHEY_COMPLEX,
-        cv2.FONT_HERSHEY_TRIPLEX,
-        cv2.FONT_HERSHEY_PLAIN,
-    ]
+def load_digit_onnx_model(use_gpu):
+    if not MODEL_ONNX_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing ONNX model: {MODEL_ONNX_PATH}. Run train_model.py first to generate digit_cnn.onnx"
+        )
 
-    features = []
-    labels = []
+    net = cv2.dnn.readNetFromONNX(str(MODEL_ONNX_PATH))
 
-    for digit in range(1, 10):
-        text = str(digit)
-        for _ in range(samples_per_digit):
-            canvas = np.zeros((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.uint8)
-
-            font = fonts[int(rng.integers(0, len(fonts)))]
-            font_scale = float(rng.uniform(0.75, 1.25))
-            thickness = int(rng.integers(1, 4))
-
-            text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
-            text_w, text_h = text_size
-
-            jitter_x = int(rng.integers(-3, 4))
-            jitter_y = int(rng.integers(-3, 4))
-            x = max(0, (MODEL_IMAGE_SIZE - text_w) // 2 + jitter_x)
-            y = min(MODEL_IMAGE_SIZE - 1, (MODEL_IMAGE_SIZE + text_h) // 2 + jitter_y)
-
-            cv2.putText(canvas, text, (x, y), font, font_scale, 255, thickness, cv2.LINE_AA)
-
-            angle = float(rng.uniform(-15, 15))
-            scale = float(rng.uniform(0.90, 1.10))
-            tx = float(rng.uniform(-2.5, 2.5))
-            ty = float(rng.uniform(-2.5, 2.5))
-
-            transform = cv2.getRotationMatrix2D((MODEL_IMAGE_SIZE / 2, MODEL_IMAGE_SIZE / 2), angle, scale)
-            transform[0, 2] += tx
-            transform[1, 2] += ty
-            canvas = cv2.warpAffine(canvas, transform, (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), borderValue=0)
-
-            if rng.random() < 0.35:
-                kernel_size = int(rng.choice([3, 5]))
-                canvas = cv2.GaussianBlur(canvas, (kernel_size, kernel_size), 0)
-
-            if rng.random() < 0.35:
-                op_kernel = np.ones((2, 2), dtype=np.uint8)
-                if rng.random() < 0.5:
-                    canvas = cv2.dilate(canvas, op_kernel, iterations=1)
-                else:
-                    canvas = cv2.erode(canvas, op_kernel, iterations=1)
-
-            noise = rng.normal(0.0, 12.0, size=canvas.shape).astype(np.float32)
-            canvas = np.clip(canvas.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-            features.append((canvas.astype(np.float32) / 255.0).reshape(-1))
-            labels.append(digit)
-
-    for _ in range(empty_samples):
-        canvas = np.zeros((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.uint8)
-
-        if rng.random() < 0.7:
-            line_count = int(rng.integers(1, 4))
-            for _ in range(line_count):
-                x1 = int(rng.integers(0, MODEL_IMAGE_SIZE))
-                y1 = int(rng.integers(0, MODEL_IMAGE_SIZE))
-                x2 = int(rng.integers(0, MODEL_IMAGE_SIZE))
-                y2 = int(rng.integers(0, MODEL_IMAGE_SIZE))
-                color = int(rng.integers(20, 110))
-                thickness = int(rng.integers(1, 3))
-                cv2.line(canvas, (x1, y1), (x2, y2), color, thickness)
-
-        noise = rng.normal(0.0, 16.0, size=canvas.shape).astype(np.float32)
-        canvas = np.clip(canvas.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-        features.append((canvas.astype(np.float32) / 255.0).reshape(-1))
-        labels.append(0)
-
-    return np.asarray(features, dtype=np.float32), np.asarray(labels, dtype=np.int32)
-
-
-def train_digit_model():
-    training_features, training_labels = generate_printed_digit_dataset()
-    classifier = MLPClassifier(
-        hidden_layer_sizes=(256, 128),
-        activation="relu",
-        solver="adam",
-        alpha=1e-4,
-        batch_size=128,
-        learning_rate_init=1e-3,
-        max_iter=60,
-        early_stopping=True,
-        n_iter_no_change=8,
-        random_state=42,
-        verbose=False,
-    )
-    classifier.fit(training_features, training_labels)
-    return classifier
-
-
-def load_or_train_digit_model():
-    if MODEL_CACHE_PATH.exists():
+    if use_gpu:
         try:
-            with MODEL_CACHE_PATH.open("rb") as model_file:
-                return pickle.load(model_file)
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
         except Exception:
-            pass
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    else:
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-    trained_model = train_digit_model()
-    try:
-        with MODEL_CACHE_PATH.open("wb") as model_file:
-            pickle.dump(trained_model, model_file)
-    except Exception:
-        pass
-    return trained_model
+    return net
 
 
-DIGIT_MODEL = load_or_train_digit_model()
+DIGIT_NET = load_digit_onnx_model(gpu_available)
 
 
 def order_points(points):
@@ -192,13 +98,13 @@ def order_points(points):
 
 
 def preprocess_frame(frame, use_gpu):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    normalized_gray = CLAHE.apply(gray)
+
     if use_gpu:
         try:
-            frame_umat = cv2.UMat(frame)
-            gray_umat = cv2.cvtColor(frame_umat, cv2.COLOR_BGR2GRAY)
-            normalized_gray = CLAHE.apply(gray_umat.get())
-            normalized_gray_umat = cv2.UMat(normalized_gray)
-            blurred_umat = cv2.GaussianBlur(normalized_gray_umat, BLUR_KERNEL_SIZE, 0)
+            normalized_umat = cv2.UMat(normalized_gray)
+            blurred_umat = cv2.GaussianBlur(normalized_umat, BLUR_KERNEL_SIZE, 0)
             binary_umat = cv2.adaptiveThreshold(
                 blurred_umat,
                 255,
@@ -207,12 +113,10 @@ def preprocess_frame(frame, use_gpu):
                 THRESH_BLOCK_SIZE,
                 THRESH_C,
             )
-            return gray_umat.get(), binary_umat.get(), True
+            return gray, binary_umat.get(), True
         except Exception:
             pass
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    normalized_gray = CLAHE.apply(gray)
     blurred = cv2.GaussianBlur(normalized_gray, BLUR_KERNEL_SIZE, 0)
     binary = cv2.adaptiveThreshold(
         blurred,
@@ -245,8 +149,7 @@ def find_grid_corners(gray, binary):
             continue
 
         points = approximation.reshape(4, 2).astype("float32")
-        ordered = order_points(points)
-        return ordered
+        return order_points(points)
 
     return None
 
@@ -254,7 +157,8 @@ def find_grid_corners(gray, binary):
 def warp_binary_for_grid(binary, perspective_matrix, use_gpu):
     if use_gpu:
         try:
-            return cv2.warpPerspective(cv2.UMat(binary), perspective_matrix, (GRID_SIZE, GRID_SIZE)).get(), True
+            warped = cv2.warpPerspective(cv2.UMat(binary), perspective_matrix, (GRID_SIZE, GRID_SIZE)).get()
+            return warped, True
         except Exception:
             pass
 
@@ -324,175 +228,101 @@ def preprocess_cell(cell_binary):
     if digit.size == 0:
         return None
 
-    canvas = np.zeros((28, 28), dtype=np.uint8)
+    canvas = np.zeros((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.uint8)
     scale = min(20.0 / w, 20.0 / h)
     resized_w = max(1, int(w * scale))
     resized_h = max(1, int(h * scale))
     resized_digit = cv2.resize(digit, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
 
-    offset_x = (28 - resized_w) // 2
-    offset_y = (28 - resized_h) // 2
+    offset_x = (MODEL_IMAGE_SIZE - resized_w) // 2
+    offset_y = (MODEL_IMAGE_SIZE - resized_h) // 2
     canvas[offset_y:offset_y + resized_h, offset_x:offset_x + resized_w] = resized_digit
     return canvas
 
 
-def predict_digit(cell_binary):
+def stable_softmax(values):
+    logits = np.asarray(values, dtype=np.float32).reshape(-1)
+    logits = logits - np.max(logits)
+    exp_values = np.exp(logits)
+    denom = float(np.sum(exp_values))
+    if denom <= 0:
+        return np.ones_like(logits, dtype=np.float32) / float(logits.size)
+    return exp_values / denom
+
+
+def predict_digit_probabilities(cell_binary):
     prepared = preprocess_cell(cell_binary)
     if prepared is None:
-        return 0, 0.0
+        probs = np.zeros(10, dtype=np.float32)
+        probs[0] = 1.0
+        return probs
 
     sample = prepared.astype(np.float32) / 255.0
-    sample = sample.reshape(1, -1)
+    blob = sample.reshape(1, 1, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE)
 
-    probabilities = DIGIT_MODEL.predict_proba(sample)[0]
-    sorted_indices = np.argsort(probabilities)[::-1]
-    prediction = int(sorted_indices[0])
-    confidence = float(probabilities[sorted_indices[0]])
-    runner_up_confidence = float(probabilities[sorted_indices[1]])
+    DIGIT_NET.setInput(blob)
+    raw_output = DIGIT_NET.forward().reshape(-1)
 
-    if prediction == 0:
-        return 0, 0.0
+    if raw_output.size != 10:
+        padded = np.zeros(10, dtype=np.float32)
+        usable = min(raw_output.size, 10)
+        padded[:usable] = raw_output[:usable]
+        raw_output = padded
 
-    if confidence < MIN_PREDICTION_CONFIDENCE:
-        return 0, confidence
-
-    if (confidence - runner_up_confidence) < MIN_CONFIDENCE_MARGIN:
-        return 0, confidence
-
-    return prediction, confidence
+    return stable_softmax(raw_output)
 
 
-def smooth_digit_prediction(history_entries):
-    weighted_votes = np.zeros(10, dtype=np.float32)
-    vote_counts = np.zeros(10, dtype=np.int32)
+def smooth_probability_history(history_entries):
+    if not history_entries:
+        probs = np.zeros(10, dtype=np.float32)
+        probs[0] = 1.0
+        return probs
+
+    weighted_sum = np.zeros(10, dtype=np.float32)
+    total_weight = 0.0
     history_length = len(history_entries)
 
-    for index, (digit, confidence) in enumerate(history_entries):
-        if digit <= 0:
-            continue
-
-        adjusted_confidence = float(confidence)
-        if adjusted_confidence < MIN_TEMPORAL_CONFIDENCE:
-            continue
-
+    for index, probs in enumerate(history_entries):
         age = (history_length - 1) - index
-        decay = TEMPORAL_DECAY ** age
-        weight = adjusted_confidence * decay
+        weight = TEMPORAL_DECAY ** age
+        weighted_sum += probs * weight
+        total_weight += weight
 
-        weighted_votes[digit] += weight
-        vote_counts[digit] += 1
+    if total_weight <= 0:
+        fallback = np.zeros(10, dtype=np.float32)
+        fallback[0] = 1.0
+        return fallback
 
-    if float(np.sum(weighted_votes)) <= 0.0:
-        return 0, 0.0
-
-    best_digit = int(np.argmax(weighted_votes))
-    total_weight = float(np.sum(weighted_votes))
-    best_share = float(weighted_votes[best_digit] / total_weight)
-
-    if best_share < MIN_DIGIT_VOTE_SHARE:
-        return 0, 0.0
-
-    if len(history_entries) >= 3 and vote_counts[best_digit] < 2:
-        return 0, 0.0
-
-    return best_digit, best_share
+    smoothed = weighted_sum / total_weight
+    smoothed = np.clip(smoothed, 1e-8, 1.0)
+    smoothed /= float(np.sum(smoothed))
+    return smoothed.astype(np.float32)
 
 
-def sanitize_grid_by_confidence(grid, confidence_grid):
-    sanitized_grid = grid.copy()
-    sanitized_confidence = confidence_grid.copy()
+def extract_confident_grid(prob_tensor):
+    grid = np.zeros((9, 9), dtype=np.int32)
+    confidence = np.zeros((9, 9), dtype=np.float32)
 
-    changed = True
-    while changed:
-        changed = False
-
-        for row in range(9):
-            for digit in range(1, 10):
-                matches = np.where(sanitized_grid[row, :] == digit)[0]
-                if len(matches) <= 1:
-                    continue
-
-                row_confidences = sanitized_confidence[row, matches]
-                keep_position = matches[int(np.argmax(row_confidences))]
-                for position in matches:
-                    if position == keep_position:
-                        continue
-                    sanitized_grid[row, position] = 0
-                    sanitized_confidence[row, position] = 0.0
-                    changed = True
-
-        for col in range(9):
-            for digit in range(1, 10):
-                matches = np.where(sanitized_grid[:, col] == digit)[0]
-                if len(matches) <= 1:
-                    continue
-
-                col_confidences = sanitized_confidence[matches, col]
-                keep_position = matches[int(np.argmax(col_confidences))]
-                for position in matches:
-                    if position == keep_position:
-                        continue
-                    sanitized_grid[position, col] = 0
-                    sanitized_confidence[position, col] = 0.0
-                    changed = True
-
-        for box_row in range(0, 9, 3):
-            for box_col in range(0, 9, 3):
-                box = sanitized_grid[box_row:box_row + 3, box_col:box_col + 3]
-                box_conf = sanitized_confidence[box_row:box_row + 3, box_col:box_col + 3]
-
-                for digit in range(1, 10):
-                    positions = np.argwhere(box == digit)
-                    if len(positions) <= 1:
-                        continue
-
-                    confidences = np.array([box_conf[r, c] for r, c in positions], dtype=np.float32)
-                    keep_idx = int(np.argmax(confidences))
-
-                    for idx, (r, c) in enumerate(positions):
-                        if idx == keep_idx:
-                            continue
-                        sanitized_grid[box_row + r, box_col + c] = 0
-                        sanitized_confidence[box_row + r, box_col + c] = 0.0
-                        changed = True
-
-    return sanitized_grid, sanitized_confidence
-
-
-def solve_sudoku(grid):
-    empty_cell = find_empty_cell(grid)
-    if not empty_cell:
-        return True
-
-    row, col = empty_cell
-    for num in range(1, 10):
-        if is_safe(grid, row, col, num):
-            grid[row, col] = num
-            if solve_sudoku(grid):
-                return True
-            grid[row, col] = 0
-    return False
-
-
-def find_empty_cell(grid):
     for row in range(9):
         for col in range(9):
-            if grid[row, col] == 0:
-                return row, col
-    return None
+            probs = prob_tensor[row, col]
+            ordered = np.argsort(probs)[::-1]
+            best = int(ordered[0])
+            second = int(ordered[1])
+            best_conf = float(probs[best])
+            second_conf = float(probs[second])
 
+            if best == 0:
+                continue
+            if best_conf < MIN_PREDICTION_CONFIDENCE:
+                continue
+            if (best_conf - second_conf) < MIN_CONFIDENCE_MARGIN:
+                continue
 
-def is_safe(grid, row, col, num):
-    if num in grid[row, :]:
-        return False
-    if num in grid[:, col]:
-        return False
+            grid[row, col] = best
+            confidence[row, col] = best_conf
 
-    box_start_row = 3 * (row // 3)
-    box_start_col = 3 * (col // 3)
-    if num in grid[box_start_row:box_start_row + 3, box_start_col:box_start_col + 3]:
-        return False
-    return True
+    return grid, confidence
 
 
 def is_valid_initial_grid(grid):
@@ -516,13 +346,118 @@ def is_valid_initial_grid(grid):
     return True
 
 
+def build_probability_candidates(prob_tensor):
+    candidates = [[[] for _ in range(9)] for _ in range(9)]
+
+    for row in range(9):
+        for col in range(9):
+            probs = prob_tensor[row, col]
+            digit_probs = probs[1:]
+            max_digit_prob = float(np.max(digit_probs))
+            empty_prob = float(probs[0])
+
+            if empty_prob >= EMPTY_CELL_PROBABILITY_THRESHOLD and max_digit_prob <= LOW_DIGIT_PROBABILITY_THRESHOLD:
+                ranked = list(range(1, 10))
+                ranked.sort(key=lambda digit: float(digit_probs[digit - 1]), reverse=True)
+                candidates[row][col] = ranked
+                continue
+
+            threshold = max(ABS_DIGIT_CANDIDATE_PROB, max_digit_prob * RELATIVE_DIGIT_CANDIDATE_RATIO)
+            allowed = [digit for digit in range(1, 10) if float(digit_probs[digit - 1]) >= threshold]
+
+            if not allowed:
+                allowed = [int(np.argmax(digit_probs)) + 1]
+
+            allowed.sort(key=lambda digit: float(digit_probs[digit - 1]), reverse=True)
+            candidates[row][col] = allowed[:MAX_DIGIT_CANDIDATES]
+
+    return candidates
+
+
+def solve_sudoku_with_probabilities(prob_tensor):
+    candidates = build_probability_candidates(prob_tensor)
+    grid = np.zeros((9, 9), dtype=np.int32)
+
+    row_used = [set() for _ in range(9)]
+    col_used = [set() for _ in range(9)]
+    box_used = [set() for _ in range(9)]
+
+    def box_index(row, col):
+        return (row // 3) * 3 + (col // 3)
+
+    def choose_next_cell():
+        best_cell = None
+        best_options = None
+        best_entropy = float("inf")
+
+        for row in range(9):
+            for col in range(9):
+                if grid[row, col] != 0:
+                    continue
+
+                valid_options = []
+                for digit in candidates[row][col]:
+                    box = box_index(row, col)
+                    if digit in row_used[row] or digit in col_used[col] or digit in box_used[box]:
+                        continue
+                    valid_options.append(digit)
+
+                if not valid_options:
+                    return (row, col), []
+
+                option_count = len(valid_options)
+                certainty = float(prob_tensor[row, col, valid_options[0]])
+                entropy_score = option_count - certainty
+
+                if best_cell is None or option_count < len(best_options) or (
+                    option_count == len(best_options) and entropy_score < best_entropy
+                ):
+                    best_cell = (row, col)
+                    best_options = valid_options
+                    best_entropy = entropy_score
+
+        return best_cell, best_options
+
+    def backtrack(filled_count):
+        if filled_count == 81:
+            return True
+
+        (row, col), options = choose_next_cell()
+        if row is None:
+            return False
+        if not options:
+            return False
+
+        options.sort(key=lambda digit: float(prob_tensor[row, col, digit]), reverse=True)
+
+        for digit in options:
+            box = box_index(row, col)
+            grid[row, col] = digit
+            row_used[row].add(digit)
+            col_used[col].add(digit)
+            box_used[box].add(digit)
+
+            if backtrack(filled_count + 1):
+                return True
+
+            grid[row, col] = 0
+            row_used[row].remove(digit)
+            col_used[col].remove(digit)
+            box_used[box].remove(digit)
+
+        return False
+
+    solved = backtrack(0)
+    return solved, grid
+
+
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 corner_history = deque(maxlen=CORNER_SMOOTHING_WINDOW)
-digit_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
-previous_grid = None
+probability_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
+previous_signature = None
 cached_solution = None
 
 while True:
@@ -537,8 +472,8 @@ while True:
         corner_history.clear()
         for row in range(9):
             for col in range(9):
-                digit_history[row][col].clear()
-        previous_grid = None
+                probability_history[row][col].clear()
+        previous_signature = None
         cached_solution = None
         cv2.putText(frame, "Grid not found", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Real-Time Sudoku Solver", frame)
@@ -552,8 +487,7 @@ while True:
     inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, smoothed_corners)
     warped_binary, gpu_warp_active = warp_binary_for_grid(binary, smoothed_perspective, gpu_pipeline_active)
 
-    sudoku_digits = np.zeros((9, 9), dtype=int)
-    sudoku_confidence = np.zeros((9, 9), dtype=np.float32)
+    probability_tensor = np.zeros((9, 9, 10), dtype=np.float32)
 
     for row in range(9):
         for col in range(9):
@@ -562,67 +496,63 @@ while True:
             x1 = col * CELL_SIZE
             x2 = (col + 1) * CELL_SIZE
             cell = warped_binary[y1:y2, x1:x2]
-            predicted_digit, prediction_confidence = predict_digit(cell)
-            digit_history[row][col].append((predicted_digit, prediction_confidence))
-            smoothed_digit, smoothed_confidence = smooth_digit_prediction(digit_history[row][col])
-            sudoku_digits[row, col] = smoothed_digit
-            sudoku_confidence[row, col] = smoothed_confidence
 
-    sudoku_digits, sudoku_confidence = sanitize_grid_by_confidence(sudoku_digits, sudoku_confidence)
+            cell_probabilities = predict_digit_probabilities(cell)
+            probability_history[row][col].append(cell_probabilities)
+            smoothed_probabilities = smooth_probability_history(probability_history[row][col])
+            probability_tensor[row, col] = smoothed_probabilities
 
-    filled_cells = int(np.count_nonzero(sudoku_digits))
-    valid_clues = is_valid_initial_grid(sudoku_digits)
+    confident_grid, _ = extract_confident_grid(probability_tensor)
+    filled_cells = int(np.count_nonzero(confident_grid))
+    valid_clues = is_valid_initial_grid(confident_grid)
 
     polygon = smoothed_corners.astype(np.int32).reshape((-1, 1, 2))
     cv2.polylines(frame, [polygon], True, (255, 0, 0), 2)
 
-    if filled_cells >= 17 and valid_clues:
-        grid_matches_previous = previous_grid is not None and np.array_equal(sudoku_digits, previous_grid)
+    solved = False
+    solved_grid = None
 
-        if grid_matches_previous and cached_solution is not None:
-            solved_grid = cached_solution
+    if filled_cells >= MIN_CLUES_TO_SOLVE:
+        signature = tuple(np.argmax(probability_tensor, axis=2).astype(np.int8).flatten().tolist())
+
+        if signature == previous_signature and cached_solution is not None:
             solved = True
+            solved_grid = cached_solution
         else:
-            solved_grid = sudoku_digits.copy()
-            solved = solve_sudoku(solved_grid)
-            previous_grid = sudoku_digits.copy()
+            solved, solved_grid = solve_sudoku_with_probabilities(probability_tensor)
+            previous_signature = signature
             cached_solution = solved_grid.copy() if solved else None
 
-        if solved:
-            for row in range(9):
-                for col in range(9):
-                    if sudoku_digits[row, col] != 0:
-                        continue
+    if solved and solved_grid is not None:
+        for row in range(9):
+            for col in range(9):
+                if confident_grid[row, col] != 0:
+                    continue
 
-                    warped_point = np.array(
-                        [[[col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2]]], dtype=np.float32
-                    )
-                    frame_point = cv2.perspectiveTransform(warped_point, inverse_matrix)[0][0]
-                    solved_text = str(int(solved_grid[row, col]))
-                    font_scale = 0.8
-                    thickness = 2
-                    text_size, baseline = cv2.getTextSize(solved_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                    text_x = int(frame_point[0] - (text_size[0] / 2))
-                    text_y = int(frame_point[1] + (text_size[1] / 2) - baseline)
+                warped_point = np.array([[[col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2]]], dtype=np.float32)
+                frame_point = cv2.perspectiveTransform(warped_point, inverse_matrix)[0][0]
+                solved_text = str(int(solved_grid[row, col]))
+                font_scale = 0.8
+                thickness = 2
+                text_size, baseline = cv2.getTextSize(solved_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                text_x = int(frame_point[0] - (text_size[0] / 2))
+                text_y = int(frame_point[1] + (text_size[1] / 2) - baseline)
 
-                    cv2.putText(
-                        frame,
-                        solved_text,
-                        (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale,
-                        (0, 255, 0),
-                        thickness,
-                        cv2.LINE_AA,
-                    )
-    else:
-        previous_grid = None
-        cached_solution = None
+                cv2.putText(
+                    frame,
+                    solved_text,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (0, 255, 0),
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
     status_color = (0, 255, 0) if valid_clues else (0, 0, 255)
     status_text = f"Detected: {filled_cells} cells"
     if not valid_clues:
-        status_text += " | invalid clues"
+        status_text += " | clues inconsistent"
     if gpu_warp_active:
         status_text += " | GPU"
     else:
@@ -634,5 +564,5 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-cap.release()   
+cap.release()
 cv2.destroyAllWindows()
