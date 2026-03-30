@@ -1,5 +1,7 @@
 import cv2
 import numpy as np
+import torch
+from torch import nn
 from pathlib import Path
 from collections import deque
 
@@ -24,7 +26,7 @@ ABS_DIGIT_CANDIDATE_PROB = 0.03
 RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
 MAX_DIGIT_CANDIDATES = 5
 
-MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.onnx")
+MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.pth")
 
 BLUR_KERNEL_SIZE = (7, 7)
 THRESH_BLOCK_SIZE = 11
@@ -61,29 +63,48 @@ print("Using GPU acceleration (faster processing)" if gpu_available else "Using 
 print("=" * 50 + "\n")
 
 
+class DigitCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(64, 10),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+
 def load_digit_onnx_model(use_gpu):
     if not MODEL_ONNX_PATH.exists():
         raise FileNotFoundError(
-            f"Missing ONNX model: {MODEL_ONNX_PATH}. Run train_model.py first to generate digit_cnn.onnx"
+            f"Missing model: {MODEL_ONNX_PATH}. Run train_model.py first to generate digit_cnn.pth"
         )
 
-    net = cv2.dnn.readNetFromONNX(str(MODEL_ONNX_PATH))
-
-    if use_gpu:
-        try:
-            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
-        except Exception:
-            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    else:
-        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-
-    return net
+    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    model = DigitCNN().to(device)
+    model.load_state_dict(torch.load(str(MODEL_ONNX_PATH), map_location=device, weights_only=True))
+    model.eval()
+    return model, device
 
 
-DIGIT_NET = load_digit_onnx_model(gpu_available)
+DIGIT_NET, DEVICE = load_digit_onnx_model(gpu_available)
 
 
 def order_points(points):
@@ -258,10 +279,12 @@ def predict_digit_probabilities(cell_binary):
         return probs
 
     sample = prepared.astype(np.float32) / 255.0
-    blob = sample.reshape(1, 1, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE)
+    blob = torch.from_numpy(sample).unsqueeze(0).unsqueeze(0).to(DEVICE)
 
-    DIGIT_NET.setInput(blob)
-    raw_output = DIGIT_NET.forward().reshape(-1)
+    with torch.no_grad():
+        logits = DIGIT_NET(blob)
+    
+    raw_output = logits.cpu().numpy().reshape(-1)
 
     if raw_output.size != 10:
         padded = np.zeros(10, dtype=np.float32)

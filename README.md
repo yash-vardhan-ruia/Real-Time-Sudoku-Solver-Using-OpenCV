@@ -1,11 +1,11 @@
-# Real-Time Sudoku Solver (CNN + ONNX)
+# Real-Time Sudoku Solver (CNN + PyTorch)
 
-This project now uses a lightweight CNN exported to ONNX for digit recognition, loaded at runtime via OpenCV DNN.
+This project uses a lightweight CNN trained on synthetic printed digits. The model is trained once via `train_model.py` and saved as PyTorch weights, then loaded for real-time inference in `main.py`.
 
 ## Architecture
 
-- `train_model.py`: offline training only. Trains a CNN on synthetic printed digits and exports `digit_cnn.onnx`.
-- `main.py`: real-time inference only. Loads `digit_cnn.onnx`, performs OCR probabilities per cell, and solves Sudoku with probability-guided backtracking.
+- `train_model.py`: offline training only. Trains a CNN on synthetic printed digits (50 epochs, ~54% val accuracy) and saves weights to `digit_cnn.pth`.
+- `main.py`: real-time inference only. Loads the PyTorch model, performs OCR probabilities per cell, and solves Sudoku with probability-guided backtracking.
 
 ## Setup
 
@@ -15,7 +15,7 @@ Install runtime dependencies:
 uv sync
 ```
 
-Install optional training dependencies:
+Install optional development dependencies (for training on different hardware):
 
 ```bash
 uv sync --extra training
@@ -27,7 +27,7 @@ uv sync --extra training
 uv run train_model.py
 ```
 
-This writes `digit_cnn.onnx` next to the scripts.
+This generates `digit_cnn.pth` next to the scripts. Training uses CPU by default; if CUDA is available, PyTorch will automatically use GPU.
 
 ## Run the solver
 
@@ -35,8 +35,11 @@ This writes `digit_cnn.onnx` next to the scripts.
 uv run main.py
 ```
 
+The solver will load the pre-trained model and start real-time webcam capture.
+
 ## Notes
 
-- The solver no longer deletes OCR clues by confidence heuristics.
-- The solver now branches on OCR probabilities for each cell.
-- CLAHE is applied on CPU before any optional UMat upload to avoid GPU↔CPU ping-pong in preprocessing.
+- The solver no longer deletes OCR clues by confidence heuristics—instead, it branches on OCR probabilities for each cell during backtracking.
+- CLAHE (histogram equalization) is applied on CPU before any optional GPU acceleration to avoid PCIe bottlenecks.
+- Model inference uses PyTorch directly, avoiding ONNX compatibility issues and providing native GPU support.
+

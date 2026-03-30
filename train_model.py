@@ -11,9 +11,9 @@ MODEL_IMAGE_SIZE = 28
 SAMPLES_PER_DIGIT = 1200
 EMPTY_SAMPLES = 1800
 BATCH_SIZE = 256
-EPOCHS = 10
+EPOCHS = 50
 LEARNING_RATE = 1e-3
-MODEL_OUTPUT_PATH = Path(__file__).with_name("digit_cnn.onnx")
+MODEL_OUTPUT_PATH = Path(__file__).with_name("digit_cnn.pth")
 
 
 def set_seed(seed=42):
@@ -209,20 +209,10 @@ def train_model():
         model.load_state_dict(best_state)
 
     model.eval()
-    dummy_input = torch.randn(1, 1, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE)
-
-    torch.onnx.export(
-        model.cpu(),
-        dummy_input,
-        str(MODEL_OUTPUT_PATH),
-        input_names=["input"],
-        output_names=["logits"],
-        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=12,
-    )
+    torch.save(model.state_dict(), str(MODEL_OUTPUT_PATH))
 
     print(f"Best validation accuracy: {best_val_acc:.4f}")
-    print(f"ONNX model exported to: {MODEL_OUTPUT_PATH}")
+    print(f"PyTorch model saved to: {MODEL_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

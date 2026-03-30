@@ -7,12 +7,12 @@ requires-python = ">=3.14"
 dependencies = [
     "opencv-contrib-python>=4.13.0.92",
     "numpy",
-    "onnx>=1.21.0",
     "torch>=2.11.0",
 ]
 
 [project.optional-dependencies]
 training = [
-    "torch",
-    "onnx",
+    "torch>=2.11.0",
+    "onnx>=1.21.0",
+    "onnxscript",
 ]
