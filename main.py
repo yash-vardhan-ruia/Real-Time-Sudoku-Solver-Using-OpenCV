@@ -1,43 +1,29 @@
 import cv2
 import numpy as np
-from collections import Counter
 
-# Enable GPU acceleration for OpenCV
+# Enable GPU/OpenCL acceleration for OpenCV
 print("=" * 50)
 print("Initializing GPU Support...")
 print("=" * 50)
 
-# Check if OpenCV was compiled with CUDA support
+# Check backend capabilities
 print(f"OpenCV Version: {cv2.__version__}")
-print(f"OpenCV Build Info: {cv2.getBuildInformation()[:500]}")
+build_info = cv2.getBuildInformation()
+print(f"OpenCL in build: {'OpenCL:                        YES' in build_info}")
 
 gpu_available = False
 try:
-    cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
-    print(f"CUDA Devices Found: {cuda_count}")
-    
-    if cuda_count > 0:
-        gpu_available = True
-        cv2.cuda.setDevice(0)
-        
-        # Get device properties
-        device = cv2.cuda.getDevice()
-        print(f"Active GPU Device: {device}")
-        print("✓ GPU acceleration ENABLED")
+    cv2.ocl.setUseOpenCL(True)
+    gpu_available = bool(cv2.ocl.haveOpenCL() and cv2.ocl.useOpenCL())
+    print(f"OpenCL Available: {cv2.ocl.haveOpenCL()}")
+    print(f"OpenCL Enabled: {cv2.ocl.useOpenCL()}")
+    if gpu_available:
+        print("✓ GPU acceleration ENABLED via OpenCL (NVIDIA/Direct3D backend)")
     else:
-        print("✗ No CUDA devices detected")
-        print("\nTo enable GPU support on Windows:")
-        print("1. Install NVIDIA CUDA Toolkit 12.x")
-        print("2. Install cuDNN from NVIDIA")
-        print("3. Rebuild OpenCV from source with CUDA support")
-        print("   OR use: pip install opencv-contrib-python (already done)")
-        print("4. Ensure GPU drivers are up to date")
+        print("✗ OpenCL runtime not active, using CPU")
 except Exception as e:
     print(f"✗ GPU Access Error: {e}")
-    print("Note: OpenCV may not be compiled with CUDA support")
-    print("      Standard opencv-python doesn't include CUDA.")
-    print("      You have installed opencv-contrib-python which is compatible.")
-    print("      Please ensure NVIDIA CUDA Toolkit is installed on your system.")
+    print("Falling back to CPU.")
 
 print("=" * 50)
 if not gpu_available:
@@ -188,14 +174,12 @@ while True:
     # Convert the frame to grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Preprocess the frame with GPU acceleration if available
-    processed = gray.copy()
+    # Preprocess the frame with GPU acceleration (OpenCL) if available
     if gpu_available:
         try:
-            gpu_gray = cv2.cuda_GpuMat()
-            gpu_gray.upload(gray)
-            gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (9, 9), 1.5).apply(gpu_gray)
-            gpu_blur.download(processed)
+            gray_umat = cv2.UMat(gray)
+            processed_umat = cv2.GaussianBlur(gray_umat, (9, 9), 0)
+            processed = processed_umat.get()
         except Exception as e:
             print(f"GPU processing failed, falling back to CPU: {e}")
             processed = cv2.GaussianBlur(gray, (9, 9), 0)
