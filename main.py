@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
+import pickle
+from pathlib import Path
 from collections import deque
-from sklearn.datasets import load_digits
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 
 GRID_SIZE = 450
 CELL_SIZE = GRID_SIZE // 9
@@ -16,6 +17,12 @@ CORNER_SMOOTHING_WINDOW = 5
 DIGIT_SMOOTHING_WINDOW = 5
 MIN_EMPTY_PIXEL_RATIO = 0.03
 MIN_DIGIT_VOTE_SHARE = 0.55
+TEMPORAL_DECAY = 0.72
+MIN_TEMPORAL_CONFIDENCE = 0.45
+MODEL_IMAGE_SIZE = 28
+SAMPLES_PER_DIGIT = 450
+EMPTY_SAMPLES = 1200
+MODEL_CACHE_PATH = Path(__file__).with_name("printed_digit_model.pkl")
 
 BLUR_KERNEL_SIZE = (7, 7)
 THRESH_BLOCK_SIZE = 11
@@ -52,14 +59,125 @@ print("Using GPU acceleration (faster processing)" if gpu_available else "Using 
 print("=" * 50 + "\n")
 
 
+def generate_printed_digit_dataset(samples_per_digit=SAMPLES_PER_DIGIT, empty_samples=EMPTY_SAMPLES):
+    rng = np.random.default_rng(42)
+    fonts = [
+        cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.FONT_HERSHEY_DUPLEX,
+        cv2.FONT_HERSHEY_COMPLEX,
+        cv2.FONT_HERSHEY_TRIPLEX,
+        cv2.FONT_HERSHEY_PLAIN,
+    ]
+
+    features = []
+    labels = []
+
+    for digit in range(1, 10):
+        text = str(digit)
+        for _ in range(samples_per_digit):
+            canvas = np.zeros((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.uint8)
+
+            font = fonts[int(rng.integers(0, len(fonts)))]
+            font_scale = float(rng.uniform(0.75, 1.25))
+            thickness = int(rng.integers(1, 4))
+
+            text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            text_w, text_h = text_size
+
+            jitter_x = int(rng.integers(-3, 4))
+            jitter_y = int(rng.integers(-3, 4))
+            x = max(0, (MODEL_IMAGE_SIZE - text_w) // 2 + jitter_x)
+            y = min(MODEL_IMAGE_SIZE - 1, (MODEL_IMAGE_SIZE + text_h) // 2 + jitter_y)
+
+            cv2.putText(canvas, text, (x, y), font, font_scale, 255, thickness, cv2.LINE_AA)
+
+            angle = float(rng.uniform(-15, 15))
+            scale = float(rng.uniform(0.90, 1.10))
+            tx = float(rng.uniform(-2.5, 2.5))
+            ty = float(rng.uniform(-2.5, 2.5))
+
+            transform = cv2.getRotationMatrix2D((MODEL_IMAGE_SIZE / 2, MODEL_IMAGE_SIZE / 2), angle, scale)
+            transform[0, 2] += tx
+            transform[1, 2] += ty
+            canvas = cv2.warpAffine(canvas, transform, (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), borderValue=0)
+
+            if rng.random() < 0.35:
+                kernel_size = int(rng.choice([3, 5]))
+                canvas = cv2.GaussianBlur(canvas, (kernel_size, kernel_size), 0)
+
+            if rng.random() < 0.35:
+                op_kernel = np.ones((2, 2), dtype=np.uint8)
+                if rng.random() < 0.5:
+                    canvas = cv2.dilate(canvas, op_kernel, iterations=1)
+                else:
+                    canvas = cv2.erode(canvas, op_kernel, iterations=1)
+
+            noise = rng.normal(0.0, 12.0, size=canvas.shape).astype(np.float32)
+            canvas = np.clip(canvas.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+            features.append((canvas.astype(np.float32) / 255.0).reshape(-1))
+            labels.append(digit)
+
+    for _ in range(empty_samples):
+        canvas = np.zeros((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.uint8)
+
+        if rng.random() < 0.7:
+            line_count = int(rng.integers(1, 4))
+            for _ in range(line_count):
+                x1 = int(rng.integers(0, MODEL_IMAGE_SIZE))
+                y1 = int(rng.integers(0, MODEL_IMAGE_SIZE))
+                x2 = int(rng.integers(0, MODEL_IMAGE_SIZE))
+                y2 = int(rng.integers(0, MODEL_IMAGE_SIZE))
+                color = int(rng.integers(20, 110))
+                thickness = int(rng.integers(1, 3))
+                cv2.line(canvas, (x1, y1), (x2, y2), color, thickness)
+
+        noise = rng.normal(0.0, 16.0, size=canvas.shape).astype(np.float32)
+        canvas = np.clip(canvas.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+        features.append((canvas.astype(np.float32) / 255.0).reshape(-1))
+        labels.append(0)
+
+    return np.asarray(features, dtype=np.float32), np.asarray(labels, dtype=np.int32)
+
+
 def train_digit_model():
-    digits = load_digits()
-    classifier = KNeighborsClassifier(n_neighbors=5, weights="distance")
-    classifier.fit(digits.data, digits.target)
+    training_features, training_labels = generate_printed_digit_dataset()
+    classifier = MLPClassifier(
+        hidden_layer_sizes=(256, 128),
+        activation="relu",
+        solver="adam",
+        alpha=1e-4,
+        batch_size=128,
+        learning_rate_init=1e-3,
+        max_iter=60,
+        early_stopping=True,
+        n_iter_no_change=8,
+        random_state=42,
+        verbose=False,
+    )
+    classifier.fit(training_features, training_labels)
     return classifier
 
 
-DIGIT_MODEL = train_digit_model()
+def load_or_train_digit_model():
+    if MODEL_CACHE_PATH.exists():
+        try:
+            with MODEL_CACHE_PATH.open("rb") as model_file:
+                return pickle.load(model_file)
+        except Exception:
+            pass
+
+    trained_model = train_digit_model()
+    try:
+        with MODEL_CACHE_PATH.open("wb") as model_file:
+            pickle.dump(trained_model, model_file)
+    except Exception:
+        pass
+    return trained_model
+
+
+DIGIT_MODEL = load_or_train_digit_model()
 
 
 def order_points(points):
@@ -223,8 +341,7 @@ def predict_digit(cell_binary):
     if prepared is None:
         return 0, 0.0
 
-    sample = cv2.resize(prepared, (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
-    sample = (sample / 255.0) * 16.0
+    sample = prepared.astype(np.float32) / 255.0
     sample = sample.reshape(1, -1)
 
     probabilities = DIGIT_MODEL.predict_proba(sample)[0]
@@ -248,28 +365,98 @@ def predict_digit(cell_binary):
 def smooth_digit_prediction(history_entries):
     weighted_votes = np.zeros(10, dtype=np.float32)
     vote_counts = np.zeros(10, dtype=np.int32)
+    history_length = len(history_entries)
 
-    for digit, confidence in history_entries:
+    for index, (digit, confidence) in enumerate(history_entries):
         if digit <= 0:
             continue
-        weight = max(0.05, float(confidence))
+
+        adjusted_confidence = float(confidence)
+        if adjusted_confidence < MIN_TEMPORAL_CONFIDENCE:
+            continue
+
+        age = (history_length - 1) - index
+        decay = TEMPORAL_DECAY ** age
+        weight = adjusted_confidence * decay
+
         weighted_votes[digit] += weight
         vote_counts[digit] += 1
 
     if float(np.sum(weighted_votes)) <= 0.0:
-        return 0
+        return 0, 0.0
 
     best_digit = int(np.argmax(weighted_votes))
     total_weight = float(np.sum(weighted_votes))
     best_share = float(weighted_votes[best_digit] / total_weight)
 
     if best_share < MIN_DIGIT_VOTE_SHARE:
-        return 0
+        return 0, 0.0
 
     if len(history_entries) >= 3 and vote_counts[best_digit] < 2:
-        return 0
+        return 0, 0.0
 
-    return best_digit
+    return best_digit, best_share
+
+
+def sanitize_grid_by_confidence(grid, confidence_grid):
+    sanitized_grid = grid.copy()
+    sanitized_confidence = confidence_grid.copy()
+
+    changed = True
+    while changed:
+        changed = False
+
+        for row in range(9):
+            for digit in range(1, 10):
+                matches = np.where(sanitized_grid[row, :] == digit)[0]
+                if len(matches) <= 1:
+                    continue
+
+                row_confidences = sanitized_confidence[row, matches]
+                keep_position = matches[int(np.argmax(row_confidences))]
+                for position in matches:
+                    if position == keep_position:
+                        continue
+                    sanitized_grid[row, position] = 0
+                    sanitized_confidence[row, position] = 0.0
+                    changed = True
+
+        for col in range(9):
+            for digit in range(1, 10):
+                matches = np.where(sanitized_grid[:, col] == digit)[0]
+                if len(matches) <= 1:
+                    continue
+
+                col_confidences = sanitized_confidence[matches, col]
+                keep_position = matches[int(np.argmax(col_confidences))]
+                for position in matches:
+                    if position == keep_position:
+                        continue
+                    sanitized_grid[position, col] = 0
+                    sanitized_confidence[position, col] = 0.0
+                    changed = True
+
+        for box_row in range(0, 9, 3):
+            for box_col in range(0, 9, 3):
+                box = sanitized_grid[box_row:box_row + 3, box_col:box_col + 3]
+                box_conf = sanitized_confidence[box_row:box_row + 3, box_col:box_col + 3]
+
+                for digit in range(1, 10):
+                    positions = np.argwhere(box == digit)
+                    if len(positions) <= 1:
+                        continue
+
+                    confidences = np.array([box_conf[r, c] for r, c in positions], dtype=np.float32)
+                    keep_idx = int(np.argmax(confidences))
+
+                    for idx, (r, c) in enumerate(positions):
+                        if idx == keep_idx:
+                            continue
+                        sanitized_grid[box_row + r, box_col + c] = 0
+                        sanitized_confidence[box_row + r, box_col + c] = 0.0
+                        changed = True
+
+    return sanitized_grid, sanitized_confidence
 
 
 def solve_sudoku(grid):
@@ -366,6 +553,7 @@ while True:
     warped_binary, gpu_warp_active = warp_binary_for_grid(binary, smoothed_perspective, gpu_pipeline_active)
 
     sudoku_digits = np.zeros((9, 9), dtype=int)
+    sudoku_confidence = np.zeros((9, 9), dtype=np.float32)
 
     for row in range(9):
         for col in range(9):
@@ -376,7 +564,11 @@ while True:
             cell = warped_binary[y1:y2, x1:x2]
             predicted_digit, prediction_confidence = predict_digit(cell)
             digit_history[row][col].append((predicted_digit, prediction_confidence))
-            sudoku_digits[row, col] = smooth_digit_prediction(digit_history[row][col])
+            smoothed_digit, smoothed_confidence = smooth_digit_prediction(digit_history[row][col])
+            sudoku_digits[row, col] = smoothed_digit
+            sudoku_confidence[row, col] = smoothed_confidence
+
+    sudoku_digits, sudoku_confidence = sanitize_grid_by_confidence(sudoku_digits, sudoku_confidence)
 
     filled_cells = int(np.count_nonzero(sudoku_digits))
     valid_clues = is_valid_initial_grid(sudoku_digits)
