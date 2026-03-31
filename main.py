@@ -28,14 +28,8 @@ ABS_DIGIT_CANDIDATE_PROB = 0.03
 RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
 MAX_DIGIT_CANDIDATES = 5
 SOLUTION_PERSISTENCE_FRAMES = 60
-MIN_CORNER_MAX_DRIFT = 2.0
-MAX_CORNER_MAX_DRIFT = 30.0
-CORNER_DRIFT_STEP = 0.5
-MIN_PERSISTENCE_FRAMES = 10
-MAX_PERSISTENCE_FRAMES = 300
-PERSISTENCE_STEP_FRAMES = 10
 
-MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.pth")
+MODEL_WEIGHTS_PATH = Path(__file__).with_name("digit_cnn.pth")
 
 BLUR_KERNEL_SIZE = (7, 7)
 THRESH_BLOCK_SIZE = 11
@@ -100,20 +94,20 @@ class DigitCNN(nn.Module):
         return x
 
 
-def load_digit_onnx_model(use_gpu):
-    if not MODEL_ONNX_PATH.exists():
+def load_digit_model(use_gpu):
+    if not MODEL_WEIGHTS_PATH.exists():
         raise FileNotFoundError(
-            f"Missing model: {MODEL_ONNX_PATH}. Run train_model.py first to generate digit_cnn.pth"
+            f"Missing model: {MODEL_WEIGHTS_PATH}. Run train_model.py first to generate digit_cnn.pth"
         )
 
     device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
     model = DigitCNN().to(device)
-    model.load_state_dict(torch.load(str(MODEL_ONNX_PATH), map_location=device, weights_only=True))
+    model.load_state_dict(torch.load(str(MODEL_WEIGHTS_PATH), map_location=device, weights_only=True))
     model.eval()
     return model, device
 
 
-DIGIT_NET, DEVICE = load_digit_onnx_model(gpu_available)
+DIGIT_NET, DEVICE = load_digit_model(gpu_available)
 
 
 def order_points(points):
@@ -565,7 +559,6 @@ while True:
     cv2.polylines(frame, [polygon], True, (255, 0, 0), 2)
 
     solved = False
-    solved_grid = None
     average_ocr_confidence = 0.0
 
     if filled_cells >= MIN_CLUES_TO_SOLVE:
@@ -573,16 +566,15 @@ while True:
 
         if signature == previous_signature and cached_solution is not None:
             solved = True
-            solved_grid = cached_solution
             solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
             last_solve_latency_ms = 0.0
         else:
             solve_start = time.perf_counter()
-            solved, solved_grid = solve_sudoku_with_probabilities(probability_tensor)
+            solved, solved_candidate = solve_sudoku_with_probabilities(probability_tensor)
             last_solve_latency_ms = (time.perf_counter() - solve_start) * 1000.0
             if solved:
                 previous_signature = signature
-                cached_solution = solved_grid.copy()
+                cached_solution = solved_candidate.copy()
                 solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
             else:
                 solution_display_counter = max(0, solution_display_counter - 1)
